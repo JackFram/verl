@@ -101,7 +101,6 @@ class Trainer(MegatronWorker):
                                                              post_process=post_process)
             parallel_model.cuda()
             return parallel_model
-
         actor_module = get_model(model_provider_func=megatron_actor_model_provider,
                                  model_type=ModelType.encoder_or_decoder,
                                  wrap_with_ddp=True)
