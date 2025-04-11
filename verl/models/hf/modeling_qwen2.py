@@ -36,6 +36,7 @@ from transformers.utils import (
 )
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
+from .utlls import _get_tidal_mask
 
 
 logger = logging.get_logger(__name__)
@@ -148,6 +149,14 @@ class Qwen2Attention(nn.Module):
         self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=True)
         self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=True)
         self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
+        
+        # TODO(Zhihao-B): make this configurable
+        if layer_idx < 2:
+            self.attn_type = "full"
+        elif layer_idx in [2, 12]:
+            self.attn_type = "selection"
+        else:
+            self.attn_type = "sparse"
 
     def forward(
         self,
@@ -156,6 +165,7 @@ class Qwen2Attention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_value: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        tidal_mask: Optional[torch.Tensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         input_shape = hidden_states.shape[:-1]
@@ -182,7 +192,7 @@ class Qwen2Attention(nn.Module):
             sliding_window = self.config.sliding_window
 
         attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
+        if self.config._attn_implementation != "eager" and self.attn_type != "selection":
             if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
                 logger.warning_once(
                     "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
@@ -190,7 +200,14 @@ class Qwen2Attention(nn.Module):
                 )
             else:
                 attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-
+                
+        if self.attn_type == "sparse":
+            assert tidal_mask is not None, "tidal_mask must be provided for sparse attention."
+                
+        # query_states shape: [batch_size, num_qo_head, qo_len, head_dim], key_states shape: [batch_size, num_kv_head, kv_len, head_dim]
+        
+        attention_mask = tidal_mask if self.attn_type == "sparse" else attention_mask
+        
         attn_output, attn_weights = attention_interface(
             self,
             query_states,
@@ -202,10 +219,16 @@ class Qwen2Attention(nn.Module):
             sliding_window=sliding_window,  # main diff with Llama
             **kwargs,
         )
+        if self.attn_type == "selection":
+            # attention_weights shape: [batch_size, num_qo_head, qo_len, kv_len]
+            # apply streaming+tidal+union
+            # the resulting sparse mask should be the same shape as the attention weights but with tidal masking
+            tidal_mask = _get_tidal_mask(attn_mask=attention_mask, attn_weights=attn_weights, window_budget=2, sink_budget=2, tidal_budget=4)
+            assert tidal_mask is not None, "tidal_mask must be provided for selection attention."
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
+        return attn_output, tidal_mask
 
 
 class Qwen2RMSNorm(nn.Module):
@@ -252,6 +275,7 @@ class Qwen2DecoderLayer(nn.Module):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        tidal_mask: Optional[torch.Tensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states
@@ -259,7 +283,7 @@ class Qwen2DecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states, self_attn_weights = self.self_attn(
+        hidden_states, tidal_mask = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -268,6 +292,7 @@ class Qwen2DecoderLayer(nn.Module):
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
+            tidal_mask=tidal_mask,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -280,9 +305,9 @@ class Qwen2DecoderLayer(nn.Module):
 
         outputs = (hidden_states,)
         if output_attentions:
-            outputs += (self_attn_weights,)
+            raise NotImplementedError("output_attentions is not implemented for Qwen2DecoderLayer")
 
-        return outputs
+        return outputs, tidal_mask
 
 
 class Qwen2RotaryEmbedding(nn.Module):
@@ -457,6 +482,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen2RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
+        self.tidal_mask = None
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -534,7 +560,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 all_hidden_states += (hidden_states,)
 
             if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
+                layer_outputs, self.tidal_mask = self._gradient_checkpointing_func(
                     partial(decoder_layer.__call__, **flash_attn_kwargs),
                     hidden_states,
                     causal_mask,
@@ -544,9 +570,10 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     use_cache,
                     cache_position,
                     position_embeddings,
+                    self.tidal_mask,
                 )
             else:
-                layer_outputs = decoder_layer(
+                layer_outputs, self.tidal_mask = decoder_layer(
                     hidden_states,
                     attention_mask=causal_mask,
                     position_ids=position_ids,
@@ -555,6 +582,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     use_cache=use_cache,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
+                    tidal_mask=self.tidal_mask,
                     **flash_attn_kwargs,
                 )
 

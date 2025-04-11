@@ -170,6 +170,8 @@ class ActorRolloutRefWorker(Worker):
         else:
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
+        torch_dtype = torch.bfloat16
+
         # override model kwargs
         actor_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
 
@@ -200,7 +202,7 @@ class ActorRolloutRefWorker(Worker):
             actor_module = Qwen2ForCausalLM.from_pretrained(pretrained_model_name_or_path=local_path,
                                                               torch_dtype=torch_dtype,
                                                               config=actor_model_config,
-                                                              attn_implementation='flash_attention_2',
+                                                              attn_implementation='flex_attention',
                                                               trust_remote_code=trust_remote_code)
 
             if use_remove_padding or self.ulysses_sequence_parallel_size > 1:
