@@ -46,7 +46,7 @@ inf_neg = torch.finfo(torch.float32).min   # sentinel used by the model
             torch.zeros((1, 1, 1, 4), dtype=torch.float32),
             0, 0, 1,
             torch.tensor([[[[False, False, False, True]]]],  dtype=torch.bool),
-            torch.tensor([[[[False, False,  True, False]]]], dtype=torch.bool),
+            torch.tensor([[[[False, False,  False, True]]]], dtype=torch.bool),
         ),
 
         # two batches
@@ -75,8 +75,8 @@ inf_neg = torch.finfo(torch.float32).min   # sentinel used by the model
             ),
             torch.tensor(
                 [
-                    [[[False, True,  False, False]]],
-                    [[[True,  False, False, False]]],
+                    [[[False, False, True, False]]],
+                    [[[False, False, False, True ]]],
                 ],
                 dtype=torch.bool,
             ),
@@ -88,7 +88,7 @@ inf_neg = torch.finfo(torch.float32).min   # sentinel used by the model
             torch.tensor(
                 [[
                     [[0.00, 0.00, 0.05, 0.05, 0.50, 0.60]],   # head 0
-                    [[0.00, 0.00, 1.00, 0.10, 0.05, 0.05]],   # head 1
+                    [[0.00, 0.00, 0.80, 0.10, 0.05, 0.05]],   # head 1
                 ]],
                 dtype=torch.float32,
             ),
